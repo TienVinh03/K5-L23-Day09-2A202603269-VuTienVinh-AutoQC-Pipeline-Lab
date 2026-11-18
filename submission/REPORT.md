@@ -63,7 +63,48 @@ Do không có người duyệt, 6 ảnh thiếu nhãn (`MISSING_LABEL_FILE`) kh�
 3. **Ảnh trùng bị biến đổi hình học / cắt xén mạnh**: Thuật toán Perceptual Hash (phash) nhạy cảm với việc crop khung hình lớn. Nếu một ảnh bị cắt xén mất > 50% diện tích hoặc xoay góc rồi chèn lại, khoảng cách Hamming phash sẽ vượt quá ngưỡng 8 và lọt qua được check `duplicates`.
 
 ## 5. Train: raw vs clean (tùy chọn, chấm riêng)
-Chưa chạy (đây là phần tùy chọn chấm riêng 15 điểm trên Google Colab / GPU; học viên tập trung tối ưu phần pipeline cốt lõi và kiểm soát chất lượng dữ liệu theo yêu cầu chuẩn của bài lab).
+Thực nghiệm so sánh mô hình YOLO (`yolo26n.pt`, 20 epochs, batch=16, imgsz=640, GPU NVIDIA RTX 3050 Ti Laptop) trên 2 biến thể:
+- `raw`: 224 ảnh (dữ liệu ban đầu, chưa qua AutoQC).
+- `clean`: 203 ảnh (`submission/export/clean_v1/`, đã qua pipeline lọc bỏ 21 ảnh lỗi, sửa cú pháp và mô phỏng duyệt 80 ảnh).
+- Đánh giá trên cùng tập kiểm thử chuẩn `data/test` (100 ảnh độc lập).
+
+### Bảng kết quả (từ `submission/results/comparison.md`)
+
+| biến thể | #ảnh train | số seed | map50 (TB ± độ lệch) | map50_95 (TB ± độ lệch) | precision (TB ± độ lệch) | recall (TB ± độ lệch) |
+|---|---|---|---|---|---|---|
+| raw | 224 | 2 | 0.724 ± 0.010 | 0.520 ± 0.010 | 0.775 ± 0.088 | 0.616 ± 0.039 |
+| clean | 203 | 2 | 0.703 ± 0.007 | 0.486 ± 0.013 | 0.770 ± 0.068 | 0.605 ± 0.057 |
+
+Chênh mAP50 (clean − raw) = **-0.021** (giảm 2.1%).
+
+### Phân tích và kết luận trung thực
+
+1. **So sánh chênh lệch mAP50 với độ lệch chuẩn giữa các seed**:
+   - Chênh lệch điểm số trung bình giữa 2 biến thể là $\Delta\text{mAP50} = -0.021$.
+   - Độ lệch chuẩn giữa các seed:
+     - Tập `raw`: $\sigma = 0.010$ (mAP50 biến động từ 0.7167 ở seed 1 đến 0.7310 ở seed 0, biên độ chênh $0.0143$).
+     - Tập `clean`: $\sigma = 0.007$ (mAP50 biến động từ 0.6983 ở seed 0 đến 0.7076 ở seed 1).
+   - Khoảng cách giữa `raw` seed 1 (0.7167) và `clean` seed 1 (0.7076) chỉ là **0.0091**, hoàn toàn nằm trong biên độ dao động ngẫu nhiên ($\sigma = 0.010$) giữa các lần chạy với seed khác nhau.
+   - **Kết luận trung thực**: Mức giảm mAP50 (-0.021) **nằm trong biên độ nhiễu thống kê** (noise). Với số lượng seed hiện tại ($N=2$) và kích thước tập kiểm thử giới hạn (100 ảnh), **chưa thể khẳng định một cách có ý nghĩa thống kê rằng mô hình train trên `clean` kém hơn hay tốt hơn `raw`**.
+
+2. **Các giả thuyết khoa học giải thích kết quả**:
+   - **Giả thuyết 1: Hiện tượng rò rỉ dữ liệu (Data Leakage) ở tập `raw` làm phồng điểm kiểm thử**:
+     - Trong tập `data/raw` ban đầu có 5 ảnh bị rò rỉ từ chính tập test (`LEAK_TEST`: `test_033`, `test_039`, `test_044`, `test_085`, `test_009`).
+     - Khi train trên `raw`, mô hình đã vô tình "học vẹt" trước 5% số ảnh của tập test (5/100 ảnh), dẫn đến mAP đánh giá trên tập test bị thổi phồng giả tạo (overoptimistic evaluation).
+     - Khi chuyển sang `clean`, bước Intake đã loại bỏ triệt để 5 ảnh rò rỉ này, buộc mô hình `clean` phải dự đoán hoàn toàn bằng năng lực tổng quát hóa thực sự trên ảnh chưa từng thấy.
+     - *Cách kiểm chứng*: Tính mAP riêng trên 95 ảnh test không bị rò rỉ giữa 2 model, hoặc đánh giá cả 2 model trên một tập test độc lập hoàn toàn mới (out-of-distribution / fresh test set).
+   - **Giả thuyết 2: Suy giảm kích thước mẫu huấn luyện (Sample Size Reduction)**:
+     - Tập huấn luyện ban đầu có kích thước rất nhỏ (chỉ 224 ảnh). Sau khi pipeline lọc bỏ 21 ảnh (ảnh lỗi kích thước, ảnh hỏng, ảnh trùng lặp, ảnh rò rỉ), tập `clean` chỉ còn 203 ảnh (giảm gần 10% lượng dữ liệu huấn luyện).
+     - Với mạng nơ-ron sâu như YOLO, ở kích thước mẫu cực nhỏ (~200 ảnh), việc mất 21 ảnh có thể làm giảm nhẹ độ đa dạng góc nhìn và bối cảnh (diversity), ảnh hưởng đến recall ($0.616 \rightarrow 0.605$).
+     - *Cách kiểm chứng*: Bổ sung kỹ thuật tăng cường dữ liệu (data augmentation: mosaic, mixup) hoặc bổ sung 21 ảnh sạch mới vào tập `clean` để cân bằng kích thước 224 ảnh rồi tái huấn luyện.
+   - **Giả thuyết 3: Phương sai lớn do tập kiểm thử (Test Set) quá nhỏ (chỉ 100 ảnh)**:
+     - Tập test chỉ có 100 ảnh. Với số lượng ảnh ít, chỉ cần 2–3 bounding box bị trượt nhẹ ngưỡng IoU 0.50 (ví dụ do đối tượng nhỏ, bị che khuất một phần) là mAP50 toàn tập đã có thể dao động 1–2%.
+     - Sự biến động giữa seed 0 và seed 1 của riêng tập `raw` đã là $\Delta = 0.0143$ ($0.7310 - 0.7167$), chiếm tới gần 70% mức chênh lệch giữa `raw` và `clean`.
+     - *Cách kiểm chứng*: Mở rộng tập test lên 500–1000 ảnh và tăng số lượng hạt giống huấn luyện ($N \ge 5$ seeds) để thu hẹp khoảng tin cậy 95% (confidence interval) của kết quả đo lường.
+   - **Giả thuyết 4: Tập `clean_v1` vẫn đang ở trạng thái `Hold` (chưa phải tập Oracle hoàn hảo)**:
+     - Pipeline kết luận `Hold` do còn 44 ảnh mang cảnh báo nghi ngờ chưa được annotator duyệt (`05_review_queue.csv`). Trong 44 ảnh này có thể vẫn còn một số nhãn gán chưa tối ưu chưa được người chỉnh sửa.
+     - Ngoài ra, autofix cắt box tràn viền và xóa box trùng ở mức dung sai mặc định cũng có thể tạo ra các biến đổi nhỏ ở ground-truth so với phân phối nhãn của tập test gốc.
+     - *Cách kiểm chứng*: Cho chuyên viên duyệt toàn bộ 44 ảnh còn lại để nâng chất lượng lên `clean_v2` (Oracle/Gold standard), sau đó tái huấn luyện và so sánh lại.
 
 ## 6. Quyết định và ghi chú AI
 (a) **Quyết định cuối**: **Hold**. 
