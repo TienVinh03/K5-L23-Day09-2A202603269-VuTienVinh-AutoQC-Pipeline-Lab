@@ -40,5 +40,88 @@ from ..model_cache import get_preds  # noqa: F401
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    c_so = cfg.get("second_opinion", {})
+    conf_thresh = c_so.get("conf", 0.25)
+    min_area_px = c_so.get("min_area_px", 600)
+    fp_conf = c_so.get("fp_conf", 0.1)
+    iou_missing = c_so.get("iou_missing", 0.3)
+    iou_match = c_so.get("iou_match", 0.5)
+    iou_loose = c_so.get("iou_loose", 0.5)
+    num_classes = len(ds.classes)
+
+    issues = []
+
+    for img_path in ds.image_files():
+        stem = img_path.stem
+        if stem not in preds or not ds.label_path(stem).exists():
+            continue
+
+        im_sz = ds.image_size(stem)
+        if im_sz is not None:
+            w_px, h_px = im_sz
+        else:
+            w_px, h_px = 1, 1
+
+        all_preds = preds.get(stem, [])
+
+        # P: Các dự đoán có conf >= conf VÀ diện tích px >= min_area_px
+        p_filtered = []
+        for r in all_preds:
+            c, conf, pcx, pcy, pw, ph = r
+            area_px = (pw * w_px) * (ph * h_px)
+            if conf >= conf_thresh and area_px >= min_area_px:
+                p_filtered.append(r)
+
+        # Lấy các nhãn hợp lệ kèm số dòng gốc
+        valid_labels = []
+        raw_lines = ds.read_label_lines(stem) or []
+        for line_no, text in raw_lines:
+            try:
+                c, lcx, lcy, lw, lh = parse_yolo_line(text)
+            except ValueError:
+                continue
+            if 0 <= c < num_classes:
+                valid_labels.append((line_no, c, lcx, lcy, lw, lh))
+
+        # 1. So sánh từng dự đoán r trong P với các nhãn hợp lệ
+        for r in p_filtered:
+            pred_c, pred_conf, pcx, pcy, pw, ph = r
+            pred_box = (pcx, pcy, pw, ph)
+
+            cands = []
+            for line_no, lbl_c, lcx, lcy, lw, lh in valid_labels:
+                lbl_box = (lcx, lcy, lw, lh)
+                iou = iou_xywh(pred_box, lbl_box)
+                if iou >= iou_missing:
+                    cands.append((lbl_c, iou))
+
+            if not cands:
+                issues.append(Issue("second_opinion", WARN, "POSSIBLE_MISSING", stem, f"model dự đoán lớp {pred_c} ({pred_conf:.2f}) nhưng nhãn thiếu", line=None, extra={"conf": pred_conf, "iou": 0.0}))
+            else:
+                same_class = [cand for cand in cands if cand[0] == pred_c]
+                if same_class:
+                    best_same_iou = max(cand[1] for cand in same_class)
+                    if best_same_iou < iou_loose:
+                        issues.append(Issue("second_opinion", WARN, "POSSIBLE_LOOSE_BOX", stem, f"nhãn lớp {pred_c} lệch so với dự đoán (IoU {best_same_iou:.2f} < {iou_loose})", line=None, extra={"iou": best_same_iou, "conf": pred_conf}))
+                else:
+                    best_diff_iou = max(cand[1] for cand in cands)
+                    if best_diff_iou >= iou_match:
+                        issues.append(Issue("second_opinion", WARN, "POSSIBLE_WRONG_CLASS", stem, f"nhãn khác lớp nhưng khớp vị trí (IoU {best_diff_iou:.2f} >= {iou_match})", line=None, extra={"iou": best_diff_iou, "conf": pred_conf}))
+
+        # 2. Kiểm tra POSSIBLE_FALSE_POS cho từng dòng nhãn hợp lệ
+        fp_preds = [p for p in all_preds if p[1] >= fp_conf]
+        for line_no, lbl_c, lcx, lcy, lw, lh in valid_labels:
+            lbl_box = (lcx, lcy, lw, lh)
+            match_found = False
+            for p in fp_preds:
+                pred_box = (p[2], p[3], p[4], p[5])
+                if iou_xywh(lbl_box, pred_box) >= iou_missing:
+                    match_found = True
+                    break
+            if not match_found:
+                issues.append(Issue("second_opinion", WARN, "POSSIBLE_FALSE_POS", stem, f"nhãn không khớp dự đoán nào của model", line=line_no, extra={"iou": 0.0}))
+
+    return issues
