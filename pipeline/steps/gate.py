@@ -20,5 +20,43 @@ from ..common import ERROR, WARN  # noqa: F401
 
 
 def decide(issues, image_stems, cfg, reviewed=frozenset()):
-    # TODO
-    raise NotImplementedError("gate chưa làm")
+    stems_set = set(image_stems)
+    reviewed_set = set(reviewed) if reviewed else set()
+    n_images = len(image_stems)
+
+    errors = [i for i in issues if i.severity == ERROR or i.severity == "error"]
+    n_errors = len(errors)
+
+    warn_images = {
+        i.image for i in issues
+        if (i.severity == WARN or i.severity == "warn")
+        and i.image in stems_set
+        and i.image not in reviewed_set
+    }
+    n_warn_images = len(warn_images)
+
+    warn_ratio = round(n_warn_images / n_images, 4) if n_images > 0 else 0.0
+    warn_ratio_hold = cfg.get("gate", {}).get("warn_ratio_hold", 0.10)
+
+    reasons = []
+    if n_errors > 0:
+        decision = "Rework"
+        reasons.append(f"Còn {n_errors} lỗi bắt buộc (error) chưa được khắc phục.")
+    elif warn_ratio >= warn_ratio_hold:
+        decision = "Hold"
+        reasons.append(f"Tỉ lệ ảnh có cảnh báo {warn_ratio:.2%} ({n_warn_images}/{n_images} ảnh) >= ngưỡng {warn_ratio_hold:.2%}.")
+    else:
+        decision = "Release"
+        if n_warn_images > 0:
+            reasons.append(f"0 lỗi bắt buộc và tỉ lệ ảnh có cảnh báo {warn_ratio:.2%} ({n_warn_images}/{n_images} ảnh) < ngưỡng {warn_ratio_hold:.2%}.")
+        else:
+            reasons.append(f"Dữ liệu sạch: 0 lỗi bắt buộc, 0 cảnh báo trên tổng số {n_images} ảnh.")
+
+    return {
+        "decision": decision,
+        "n_errors": n_errors,
+        "n_warn_images": n_warn_images,
+        "n_images": n_images,
+        "warn_ratio": warn_ratio,
+        "reasons": reasons,
+    }
